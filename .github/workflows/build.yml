@@ -30,7 +30,7 @@ on:
   push:
     branches:
       - stable
-      - testing
+      - master
       - unstable
 
 concurrency:
