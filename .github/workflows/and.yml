@@ -56,7 +56,9 @@ jobs:
       - name: Set build tags
         run: |
           set -xeuo pipefail
-          TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
+          # 精简版 tags：去掉 with_wireguard, with_tailscale, with_ccm, with_ocm
+          # （官方 release/DEFAULT_BUILD_TAGS_OTHERS 未被精简，故这里直接写死精简后的列表）
+          TAGS="with_gvisor,with_quic,with_dhcp,with_utls,with_acme,with_clash_api,badlinkname,tfogo_checklinkname0"
           echo "BUILD_TAGS=${TAGS}" >> "${GITHUB_ENV}"
       - name: Set shared ldflags
         run: |
