@@ -1,0 +1,179 @@
+name: Release slim build android
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version name (不带 v 前缀，如 1.12.0)"
+        required: true
+        type: string
+
+jobs:
+  calculate_version:
+    name: Calculate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.outputs.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 0
+      - name: Set outputs
+        id: outputs
+        run: |-
+          echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ubuntu-26.04
+    needs:
+      - calculate_version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Android ----
+          - { os: android, arch: arm64, ndk: "aarch64-linux-android23" }
+          - { os: android, arch: arm, ndk: "armv7a-linux-androideabi23" }
+          - { os: android, arch: amd64, ndk: "x86_64-linux-android23" }
+          - { os: android, arch: "386", ndk: "i686-linux-android23" }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 1
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.12
+          cache: false
+      - name: Cache Go modules
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-linux-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-linux-
+      - name: Setup Android NDK
+        if: matrix.os == 'android'
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+      - name: Set tag
+        run: |-
+          git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
+          git tag v${{ needs.calculate_version.outputs.version }} -f
+      - name: Set build tags
+        run: |
+          set -xeuo pipefail
+          # 精简版 tags：去掉 with_wireguard, with_tailscale, with_ccm, with_ocm,
+          # with_dhcp, with_acme, with_naive_outbound（与 and.yml 保持一致的裁剪思路）
+          TAGS="with_gvisor,with_quic,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0"
+          echo "BUILD_TAGS=${TAGS}" >> "${GITHUB_ENV}"
+      - name: Set shared ldflags
+        run: |
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "${GITHUB_ENV}"
+      - name: Build (non-Android)
+        if: matrix.os != 'android'
+        run: |
+          set -xeuo pipefail
+          mkdir -p dist
+          OUT=dist/sing-box
+          if [[ "${{ matrix.os }}" == "windows" ]]; then OUT="${OUT}.exe"; fi
+          go build -v -trimpath -o "$OUT" -tags "${BUILD_TAGS}" \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sing-box
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          GOARM: ${{ matrix.goarm }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (Android)
+        if: matrix.os == 'android'
+        run: |
+          set -xeuo pipefail
+          go install -v ./cmd/internal/build
+          export CC='${{ matrix.ndk }}-clang'
+          export CXX="${CC}++"
+          mkdir -p dist
+          GOOS=$BUILD_GOOS GOARCH=$BUILD_GOARCH build go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sing-box
+        env:
+          CGO_ENABLED: "1"
+          BUILD_GOOS: ${{ matrix.os }}
+          BUILD_GOARCH: ${{ matrix.arch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set name
+        run: |-
+          DIR_NAME="sing-box-${{ needs.calculate_version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
+          if [[ -n "${{ matrix.goarm }}" ]]; then
+            DIR_NAME="${DIR_NAME}v${{ matrix.goarm }}"
+          fi
+          echo "DIR_NAME=${DIR_NAME}" >> "${GITHUB_ENV}"
+      - name: Archive (tar.gz)
+        if: matrix.os != 'windows'
+        run: |
+          set -xeuo pipefail
+          cd dist
+          mkdir -p "${DIR_NAME}"
+          cp ../LICENSE "${DIR_NAME}"
+          cp sing-box "${DIR_NAME}"
+          tar -czvf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
+          rm -r "${DIR_NAME}"
+      - name: Archive (zip)
+        if: matrix.os == 'windows'
+        run: |
+          set -xeuo pipefail
+          cd dist
+          mkdir -p "${DIR_NAME}"
+          cp ../LICENSE "${DIR_NAME}"
+          cp sing-box.exe "${DIR_NAME}"
+          zip -r "${DIR_NAME}.zip" "${DIR_NAME}"
+          rm -r "${DIR_NAME}"
+      - name: Cleanup
+        run: rm -f dist/sing-box dist/sing-box.exe
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
+          path: "dist"
+
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs:
+      - calculate_version
+      - build
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 1
+      - name: Set tag
+        run: |-
+          git tag v${{ needs.calculate_version.outputs.version }} -f
+          git push origin v${{ needs.calculate_version.outputs.version }} -f
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download builds
+        uses: actions/download-artifact@v5
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.calculate_version.outputs.version }}
+          name: v${{ needs.calculate_version.outputs.version }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
